@@ -1,0 +1,15 @@
+[package]
+name = "trident-api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+trident-common = { path = "../common" }
+tokio = { version = "1", features = ["full"] }
+tonic = "0.11"
+prost = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[build-dependencies]
+tonic-build = "0.11"
