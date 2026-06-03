@@ -264,11 +264,7 @@ mod tests {
         ResponseTemplate::new(200).set_body_json(body)
     }
 
-    async fn make_streamer(
-        db_url: &str,
-        redis_url: &str,
-        rpc_url: String,
-    ) -> Streamer {
+    async fn make_streamer(db_url: &str, redis_url: &str, rpc_url: String) -> Streamer {
         let db = sqlx::PgPool::connect(db_url).await.unwrap();
         let redis = redis::Client::open(redis_url)
             .unwrap()
@@ -287,8 +283,14 @@ mod tests {
     }
 
     async fn reset_db(pool: &sqlx::PgPool) {
-        sqlx::query("DELETE FROM soroban_events").execute(pool).await.unwrap();
-        sqlx::query("DELETE FROM ledger_metadata").execute(pool).await.unwrap();
+        sqlx::query("DELETE FROM soroban_events")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM ledger_metadata")
+            .execute(pool)
+            .await
+            .unwrap();
         sqlx::query("UPDATE system_state SET value = '0' WHERE key = 'latest_ledger_cursor'")
             .execute(pool)
             .await
@@ -410,14 +412,13 @@ mod tests {
 
         let mut cursor = 0u64;
         // tokio-retry with max 5 retries and 200ms base — allow up to 10s
-        let result = tokio::time::timeout(
-            Duration::from_secs(10),
-            s.poll_once(&mut cursor),
-        )
-        .await
-        .expect("poll_once timed out")
-        ;
-        assert!(result.is_err(), "poll_once should fail after retries exhausted");
+        let result = tokio::time::timeout(Duration::from_secs(10), s.poll_once(&mut cursor))
+            .await
+            .expect("poll_once timed out");
+        assert!(
+            result.is_err(),
+            "poll_once should fail after retries exhausted"
+        );
     }
 
     #[tokio::test]
@@ -452,6 +453,9 @@ mod tests {
         let mut cursor = 0u64;
         let total = s.poll_once(&mut cursor).await.unwrap();
 
-        assert_eq!(total, 205, "should process 200 + 5 = 205 events across two pages");
+        assert_eq!(
+            total, 205,
+            "should process 200 + 5 = 205 events across two pages"
+        );
     }
 }
