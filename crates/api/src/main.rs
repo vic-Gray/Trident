@@ -13,13 +13,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
+    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL is required");
+
+    let db_pool = sqlx::PgPool::connect(&database_url).await?;
+    tracing::info!("Database connected");
+
     let addr: SocketAddr = std::env::var("GRPC_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:50051".into())
         .parse()?;
 
     tracing::info!(%addr, "Trident gRPC server listening");
 
-    let events_service = services::events::EventsServiceImpl::new();
+    let events_service = services::events::EventsServiceImpl::new(db_pool);
 
     tonic::transport::Server::builder()
         .add_service(trident::events_server::EventsServer::new(events_service))
