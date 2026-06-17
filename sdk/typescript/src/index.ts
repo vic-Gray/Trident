@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { httpStatusToError, TridentError } from "./errors.js";
+import { createSubscription } from "./subscription.js";
 
 export { TridentError } from "./errors.js";
 export type { TridentErrorCode } from "./errors.js";
@@ -24,16 +25,16 @@ export const EventTypeSchema = z.enum(["contract", "system", "diagnostic"]);
 export type EventType = z.infer<typeof EventTypeSchema>;
 
 export const SorobanEventSchema = z.object({
-  id: z.string().uuid(),
+  id: z.string(),
   contractId: z.string(),
   ledgerSequence: z.number().int().nonnegative(),
-  ledgerTimestamp: z.string().datetime(),
+  ledgerTimestamp: z.string(),
   transactionHash: z.string(),
   eventIndex: z.number().int().nonnegative(),
   eventType: EventTypeSchema,
   topics: z.array(z.string()),
   data: z.unknown(),
-  createdAt: z.string().datetime(),
+  createdAt: z.string(),
 });
 export type SorobanEvent = z.infer<typeof SorobanEventSchema>;
 
@@ -201,11 +202,20 @@ export class TridentClient {
   /**
    * Open a real-time WebSocket subscription to events emitted by a contract.
    *
-   * Calls `onEvent` for every new matching event. Reconnects automatically on
-   * unexpected close. Returns a `Subscription` handle.
+   * Replaces `https://` with `wss://` (and `http://` with `ws://`) to derive
+   * the WebSocket URL. Reconnects with exponential backoff (500ms–30s) on
+   * unexpected close. Returns a `Subscription` handle whose `unsubscribe()`
+   * closes the socket and cancels any pending reconnect.
    */
   subscribeToContract(params: SubscribeToContractParams): Subscription {
-    void params;
-    throw new Error("not yet implemented");
+    const wsBase = this.config.apiUrl
+      .replace(/^https:\/\//, "wss://")
+      .replace(/^http:\/\//, "ws://");
+
+    const qs = new URLSearchParams({ contractId: params.contractId });
+    if (params.topic0) qs.set("topic0", params.topic0);
+
+    const wsUrl = `${wsBase}/ws?${qs.toString()}`;
+    return createSubscription(wsUrl, params);
   }
 }
