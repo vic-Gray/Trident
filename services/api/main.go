@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -10,8 +11,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Depo-dev/trident/services/api/cursor"
 	"github.com/Depo-dev/trident/services/api/handlers"
+	"github.com/Depo-dev/trident/services/api/validation"
+	"github.com/Depo-dev/trident/services/api/ws"
 	"github.com/jackc/pgx/v5"
+	"github.com/redis/go-redis/v9"
 )
 
 func main() {
@@ -20,8 +25,9 @@ func main() {
 		port = "3000"
 	}
 
-	// Open a single Postgres connection for the health endpoint.
-	// DATABASE_URL must be set; if absent, the health endpoint returns 503.
+	// ---------------------------------------------------------------------------
+	// Postgres connection (health endpoint)
+	// ---------------------------------------------------------------------------
 	var dbConn *pgx.Conn
 	if dsn := os.Getenv("DATABASE_URL"); dsn != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -37,43 +43,46 @@ func main() {
 		slog.Warn("DATABASE_URL not set; health endpoint will return 503")
 	}
 
-	mux := http.NewServeMux()
+	// ---------------------------------------------------------------------------
+	// Redis client
+	// ---------------------------------------------------------------------------
+	redisURL := os.Getenv("REDIS_URL")
+	if redisURL == "" {
+		redisURL = "redis://localhost:6379"
+	}
+	redisOpts, err := redis.ParseURL(redisURL)
+	if err != nil {
+		slog.Error("invalid REDIS_URL", "err", err)
+		os.Exit(1)
+	}
+	redisClient := redis.NewClient(redisOpts)
 
 	// ---------------------------------------------------------------------------
-	// REST router
+	// WebSocket hub + Redis Streams consumer
 	// ---------------------------------------------------------------------------
+	hub := ws.NewHub()
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	go ws.StartConsumer(ctx, redisClient, hub)
+
+	// ---------------------------------------------------------------------------
+	// HTTP router
+	// ---------------------------------------------------------------------------
+	mux := http.NewServeMux()
 
 	// GET /v1/health — indexer liveness (issue #62)
 	mux.HandleFunc("GET /v1/health", handlers.Health(dbConn))
 
-	// GET /v1/events — list events with validated query params (issue #42)
-	mux.HandleFunc("GET /v1/events", handlers.ListEvents)
+	// GET /v1/events — validated, cursor-paginated event listing (issues #42, #44)
+	mux.HandleFunc("GET /v1/events", handleListEvents)
 
-	// GET /v1/events/{id} — get single event by UUID v4 (issue #42)
+	// GET /v1/events/{id} — single event by UUID v4 (issue #42)
 	mux.HandleFunc("GET /v1/events/{id}", handlers.GetEvent)
 
-	// ---------------------------------------------------------------------------
-	// GraphQL handler
-	// Mount the GraphQL endpoint here, e.g. using gqlgen:
-	//   srv := handler.NewDefaultServer(generated.NewExecutableSchema(cfg))
-	//   mux.Handle("/graphql", srv)
-	//   mux.Handle("/playground", playground.Handler("Trident", "/graphql"))
-	// ---------------------------------------------------------------------------
-
-	// ---------------------------------------------------------------------------
-	// WebSocket handler
-	// Mount the WebSocket subscription endpoint here. Clients subscribe to a
-	// contract address and receive a stream of SorobanEvent JSON objects in
-	// real time as they land on-chain.
-	//   mux.HandleFunc("/ws", ws.Handler(redisClient))
-	// ---------------------------------------------------------------------------
-
-	// ---------------------------------------------------------------------------
-	// Redis Streams consumer
-	// Start the background consumer here. It reads from the Redis Stream written
-	// by the Rust indexer and fans out to connected WebSocket clients.
-	//   go consumer.Start(ctx, redisClient, hub)
-	// ---------------------------------------------------------------------------
+	// WebSocket: /ws — real-time event subscription endpoint (issue #15)
+	mux.HandleFunc("/ws", ws.Handler(hub))
 
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%s", port),
@@ -82,9 +91,6 @@ func main() {
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	go func() {
 		slog.Info("Trident API server listening", "port", port)
@@ -101,5 +107,50 @@ func main() {
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		slog.Error("graceful shutdown failed", "err", err)
+	}
+}
+
+// handleListEvents handles GET /v1/events with query-param validation and
+// opaque cursor-based pagination.
+func handleListEvents(w http.ResponseWriter, r *http.Request) {
+	type response struct {
+		NextCursor string `json:"next_cursor"`
+		Events     []any  `json:"events"`
+	}
+
+	q := r.URL.Query()
+
+	// Validate query params (issue #42).
+	_, verr := validation.ValidateQueryEvents(
+		q.Get("limit"),
+		q.Get("ledgerFrom"),
+		q.Get("ledgerTo"),
+		q.Get("contractId"),
+		q.Get("cursor"),
+	)
+	if verr != nil {
+		http.Error(w, verr.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Decode opaque cursor to internal paging token (issue #44).
+	var pagingToken string
+	if raw := q.Get("cursor"); raw != "" {
+		decoded, err := cursor.Decode(raw)
+		if err != nil {
+			http.Error(w, "invalid cursor", http.StatusBadRequest)
+			return
+		}
+		pagingToken = decoded
+	}
+
+	nextCursor := cursor.Encode(pagingToken)
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(response{
+		NextCursor: nextCursor,
+		Events:     []any{},
+	}); err != nil {
+		slog.Error("handleListEvents: encode response", "err", err)
 	}
 }

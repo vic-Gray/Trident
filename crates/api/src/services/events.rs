@@ -290,9 +290,13 @@ mod tests {
 
     macro_rules! require_services {
         () => {{
+            let in_ci = std::env::var("CI").map(|v| v == "true").unwrap_or(false);
             let db = match std::env::var("TEST_DATABASE_URL") {
                 Ok(url) => url,
                 Err(_) => {
+                    if in_ci {
+                        panic!("TEST_DATABASE_URL must be set in CI");
+                    }
                     eprintln!("SKIP: TEST_DATABASE_URL not set");
                     return;
                 }
@@ -300,6 +304,9 @@ mod tests {
             let rd = match std::env::var("TEST_REDIS_URL") {
                 Ok(url) => url,
                 Err(_) => {
+                    if in_ci {
+                        panic!("TEST_REDIS_URL must be set in CI");
+                    }
                     eprintln!("SKIP: TEST_REDIS_URL not set");
                     return;
                 }

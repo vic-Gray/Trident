@@ -86,6 +86,62 @@ jobs:
         run: npm run lint
 
   # ---------------------------------------------------------------------------
+  # Rust integration tests — real Postgres + Redis
+  # Runs integration tests that are silently skipped when TEST_DATABASE_URL
+  # and TEST_REDIS_URL are absent. Scoped to push/PR against main and dev.
+  # ---------------------------------------------------------------------------
+  rust-integration:
+    name: Rust integration tests
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') ||
+      github.event_name == 'pull_request' && (github.base_ref == 'main' || github.base_ref == 'dev')
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: trident
+          POSTGRES_DB: trident_test
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artefacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Apply database schema
+        env:
+          PGPASSWORD: trident
+        run: |
+          psql -h localhost -U postgres -d trident_test \
+            -f database/schema.sql
+
+      - name: Run integration tests
+        env:
+          TEST_DATABASE_URL: postgres://postgres:trident@localhost:5432/trident_test
+          TEST_REDIS_URL: redis://localhost:6379
+          CI: "true"
+        run: cargo test --all -- --include-ignored
+
+  # ---------------------------------------------------------------------------
   # Docker — build images (no push)
   # ---------------------------------------------------------------------------
   docker:
