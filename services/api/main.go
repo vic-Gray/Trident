@@ -10,8 +10,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Depo-dev/trident/services/api/grpcclient"
 	"github.com/Depo-dev/trident/services/api/handlers"
+	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/jackc/pgx/v5"
+	"google.golang.org/grpc"
 )
 
 func main() {
@@ -40,11 +43,27 @@ func main() {
 	mux := http.NewServeMux()
 
 	// ---------------------------------------------------------------------------
+	// gRPC client — connects to the Rust API with exponential backoff (issue #45).
+	// ---------------------------------------------------------------------------
+	var grpcConn *grpc.ClientConn
+	if grpcTarget := os.Getenv("GRPC_TARGET"); grpcTarget != "" {
+		var err error
+		grpcConn, err = grpcclient.Connect(grpcTarget)
+		if err != nil {
+			slog.Warn("could not create gRPC client", "err", err)
+		} else {
+			defer grpcConn.Close()
+		}
+	} else {
+		slog.Warn("GRPC_TARGET not set; gRPC client disabled")
+	}
+
+	// ---------------------------------------------------------------------------
 	// REST router
 	// ---------------------------------------------------------------------------
 
 	// GET /v1/health — indexer liveness (issue #62)
-	mux.HandleFunc("GET /v1/health", handlers.Health(dbConn))
+	mux.HandleFunc("GET /v1/health", handlers.Health(dbConn, grpcConn))
 
 	// GET /v1/events — list events with validated query params (issue #42)
 	mux.HandleFunc("GET /v1/events", handlers.ListEvents)
@@ -75,9 +94,24 @@ func main() {
 	//   go consumer.Start(ctx, redisClient, hub)
 	// ---------------------------------------------------------------------------
 
+	// ---------------------------------------------------------------------------
+	// Middleware stack (issue #16)
+	// RateLimit → Auth → mux.
+	// Auth skips GET /v1/health; RateLimit passes through keyless requests so
+	// Auth can return the correct 401.
+	// ---------------------------------------------------------------------------
+
+	// Load accepted key hashes from the environment.
+	// API_KEY_HASHES is a comma-separated list of HMAC-SHA256 hex digests.
+	validHashes := middleware.ParseKeyHashes(os.Getenv("API_KEY_HASHES"))
+
+	var handler http.Handler = mux
+	handler = middleware.Auth(validHashes, handler)
+	handler = middleware.RateLimit(handler)
+
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%s", port),
-		Handler:      mux,
+		Handler:      handler,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  120 * time.Second,

@@ -1,9 +1,18 @@
 version: "3.9"
 
-# Production compose — runs all four services.
-# All secrets are passed via environment variables; never hardcode values here.
+# Production compose — runs all five containers.
+# Copy .env.example to .env and fill in every value before running.
+# Start: docker compose -f docker-compose.yml up -d
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
 
 services:
+  # ── Infrastructure ─────────────────────────────────────────────────────────
+
   postgres:
     image: postgres:15-alpine
     environment:
@@ -19,18 +28,36 @@ services:
       retries: 10
       start_period: 15s
     restart: unless-stopped
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 256m
 
   redis:
     image: redis:7-alpine
     volumes:
       - redis_data:/data
     command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
     restart: unless-stopped
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+
+  # ── Rust services ──────────────────────────────────────────────────────────
 
   indexer:
     build:
-      context: ../crates/indexer
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: crates/indexer/Dockerfile
     environment:
       DATABASE_URL: ${DATABASE_URL}
       REDIS_URL: ${REDIS_URL}
@@ -38,34 +65,82 @@ services:
       NETWORK: ${NETWORK}
       POLL_INTERVAL_MS: ${POLL_INTERVAL_MS}
       INDEX_DIAGNOSTIC: ${INDEX_DIAGNOSTIC}
-      LOG_LEVEL: ${LOG_LEVEL}
+      REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN}
+      RUST_LOG: ${LOG_LEVEL}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
-        condition: service_started
+        condition: service_healthy
     restart: unless-stopped
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 512m
 
-  api:
+  grpc-api:
     build:
-      context: ../services/api
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: crates/api/Dockerfile
     environment:
       DATABASE_URL: ${DATABASE_URL}
       REDIS_URL: ${REDIS_URL}
-      PORT: ${PORT}
-      API_KEY_SALT: ${API_KEY_SALT}
-      LOG_LEVEL: ${LOG_LEVEL}
-    ports:
-      - "${PORT}:${PORT}"
+      GRPC_ADDR: ${GRPC_ADDR}
+      RUST_LOG: ${LOG_LEVEL}
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 50051 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
     depends_on:
       postgres:
         condition: service_healthy
       redis:
-        condition: service_started
-      indexer:
-        condition: service_started
+        condition: service_healthy
     restart: unless-stopped
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  # ── Go API ─────────────────────────────────────────────────────────────────
+
+  go-api:
+    build:
+      context: ..
+      dockerfile: services/api/Dockerfile
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      PORT: ${PORT}
+      API_KEY_SALT: ${API_KEY_SALT}
+      API_KEY_HASHES: ${API_KEY_HASHES}
+      RATE_LIMIT_RPS: ${RATE_LIMIT_RPS}
+      RATE_LIMIT_BURST: ${RATE_LIMIT_BURST}
+      GRPC_TARGET: ${GRPC_TARGET}
+    ports:
+      - "${PORT}:${PORT}"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:${PORT}/v1/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      grpc-api:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 256m
 
 volumes:
   postgres_data:

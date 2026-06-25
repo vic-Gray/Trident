@@ -8,7 +8,10 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Depo-dev/trident/services/api/grpcclient"
 	"github.com/jackc/pgx/v5"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 )
 
 const healthStalenessThreshold = 60 * time.Second
@@ -26,20 +29,35 @@ type HealthResponse struct {
 		LastLedgerIndexed *int64  `json:"last_ledger_indexed"`
 		LastPollAt        *string `json:"last_poll_at"`
 	} `json:"indexer"`
+	GRPCApi string `json:"grpc_api,omitempty"`
 }
 
 // Health handles GET /v1/health.
 //
-// Acceptance criteria (issue #62):
-//   - Returns the indexer's last_ledger_indexed and last_poll_at fields from system_state.
+// Acceptance criteria (issue #62 / #45):
+//   - Returns the indexer's last_ledger_indexed and last_poll_at from system_state.
 //   - Returns HTTP 503 with status "degraded" when last_poll_at is NULL or older than 60 s.
 //   - Returns HTTP 200 with status "ok" otherwise.
+//   - Reflects gRPC connectivity state in the "grpc_api" field when a conn is provided.
 //
-// db may be nil when DATABASE_URL is not configured; the endpoint returns 503 in that case.
-func Health(db *pgx.Conn) http.HandlerFunc {
+// db may be nil when DATABASE_URL is not configured; returns 503 in that case.
+// grpcConn may be nil when the gRPC client is not yet wired in.
+func Health(db *pgx.Conn, grpcConn *grpc.ClientConn) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		var resp HealthResponse
+
+		// Reflect gRPC connection state (issue #45).
+		if grpcConn != nil {
+			state := grpcConn.GetState()
+			resp.GRPCApi = grpcclient.StateString(state)
+			if state == connectivity.TransientFailure || state == connectivity.Shutdown {
+				resp.Status = "degraded"
+			}
+		}
+
 		if db == nil {
-			writeJSON(w, http.StatusServiceUnavailable, HealthResponse{Status: "degraded"})
+			resp.Status = "degraded"
+			writeJSON(w, http.StatusServiceUnavailable, resp)
 			return
 		}
 
@@ -58,11 +76,10 @@ func Health(db *pgx.Conn) http.HandlerFunc {
 		// Scan into nullable pointers directly using pgx semantics.
 		err := row.Scan(&lastLedger, &lastPollAt)
 		if err != nil && err != pgx.ErrNoRows {
-			writeJSON(w, http.StatusServiceUnavailable, HealthResponse{Status: "degraded"})
+			resp.Status = "degraded"
+			writeJSON(w, http.StatusServiceUnavailable, resp)
 			return
 		}
-
-		var resp HealthResponse
 
 		if lastLedger != nil {
 			resp.Indexer.LastLedgerIndexed = lastLedger
@@ -79,8 +96,14 @@ func Health(db *pgx.Conn) http.HandlerFunc {
 			return
 		}
 
-		resp.Status = "ok"
-		writeJSON(w, http.StatusOK, resp)
+		if resp.Status == "" {
+			resp.Status = "ok"
+		}
+		code := http.StatusOK
+		if resp.Status != "ok" {
+			code = http.StatusServiceUnavailable
+		}
+		writeJSON(w, code, resp)
 	}
 }
 
