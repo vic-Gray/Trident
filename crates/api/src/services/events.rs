@@ -290,9 +290,13 @@ mod tests {
 
     macro_rules! require_services {
         () => {{
+            let in_ci = std::env::var("CI").map(|v| v == "true").unwrap_or(false);
             let db = match std::env::var("TEST_DATABASE_URL") {
                 Ok(url) => url,
                 Err(_) => {
+                    if in_ci {
+                        panic!("TEST_DATABASE_URL must be set in CI");
+                    }
                     eprintln!("SKIP: TEST_DATABASE_URL not set");
                     return;
                 }
@@ -300,6 +304,9 @@ mod tests {
             let rd = match std::env::var("TEST_REDIS_URL") {
                 Ok(url) => url,
                 Err(_) => {
+                    if in_ci {
+                        panic!("TEST_REDIS_URL must be set in CI");
+                    }
                     eprintln!("SKIP: TEST_REDIS_URL not set");
                     return;
                 }
@@ -320,6 +327,9 @@ mod tests {
 
     async fn seed_events(pool: &PgPool, contract_id: &str, count: usize) {
         for i in 0..count {
+            // Include contract_id in the tx hash so rows seeded for different
+            // contracts never share a (transaction_hash, event_index) pair and
+            // ON CONFLICT DO NOTHING silently drops them across test runs.
             sqlx::query(
                 r#"
                 INSERT INTO soroban_events
@@ -331,7 +341,7 @@ mod tests {
             )
             .bind(contract_id)
             .bind((100 + i) as i64)
-            .bind(format!("txhash{i}"))
+            .bind(format!("txhash_{contract_id}_{i}"))
             .bind(i as i32)
             .execute(pool)
             .await
