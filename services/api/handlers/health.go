@@ -14,6 +14,13 @@ import (
 
 const healthStalenessThreshold = 60 * time.Second
 
+// DBPool is the minimal query surface the health check needs. Both *pgx.Conn
+// and *pgxpool.Pool satisfy it, so handlers stay agnostic to how connections
+// are pooled (the production server uses a *pgxpool.Pool behind PgBouncer).
+type DBPool interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
 // HealthRow holds the columns we read from system_state for the health check.
 type HealthRow struct {
 	LastLedgerIndexed sql.NullInt64
@@ -37,7 +44,7 @@ type HealthResponse struct {
 //   - Returns HTTP 200 with status "ok" otherwise.
 //
 // db may be nil when DATABASE_URL is not configured; the endpoint returns 503 in that case.
-func Health(db *pgx.Conn) http.HandlerFunc {
+func Health(db DBPool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if db == nil {
 			httputil.WriteError(w, http.StatusServiceUnavailable, httputil.INTERNAL, "database connection unavailable")

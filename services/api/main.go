@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -15,8 +16,11 @@ import (
 	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/Depo-dev/trident/services/api/ws"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
+
+const defaultDBPoolSize = 5
 
 func main() {
 	port := os.Getenv("PORT")
@@ -24,14 +28,10 @@ func main() {
 		port = "3000"
 	}
 
-	// ---------------------------------------------------------------------------
-	// gRPC client connection
-	// ---------------------------------------------------------------------------
 	grpcAddr := os.Getenv("GRPC_ADDR")
 	if grpcAddr == "" {
 		grpcAddr = "localhost:5000"
 	}
-
 	grpcClient, err := grpc.NewClient(context.Background(), grpcAddr)
 	if err != nil {
 		slog.Error("failed to connect to gRPC backend", "err", err)
@@ -40,31 +40,26 @@ func main() {
 	defer grpcClient.Close()
 	handlers.SetEventsClient(grpcClient)
 
-	// ---------------------------------------------------------------------------
-	// Postgres connection (health endpoint)
-	// ---------------------------------------------------------------------------
-	var dbConn *pgx.Conn
+	var pool *pgxpool.Pool
 	if dsn := os.Getenv("DATABASE_URL"); dsn != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		conn, err := pgx.Connect(ctx, dsn)
+		p, err := newDBPool(ctx, dsn, dbPoolSizeFromEnv())
 		cancel()
 		if err != nil {
-			slog.Warn("could not connect to database; health endpoint will return 503", "err", err)
+			slog.Warn("could not connect to database; DB-backed endpoints will return 503", "err", err)
 		} else {
-			dbConn = conn
-			defer func() {
-				if err := conn.Close(context.Background()); err != nil {
-					slog.Debug("database connection close failed", "err", err)
-				}
-			}()
+			pool = p
+			defer pool.Close()
 		}
 	} else {
-		slog.Warn("DATABASE_URL not set; health endpoint will return 503")
+		slog.Warn("DATABASE_URL not set; DB-backed endpoints will return 503")
 	}
 
-	// ---------------------------------------------------------------------------
-	// Redis client
-	// ---------------------------------------------------------------------------
+	var healthDB handlers.DBPool
+	if pool != nil {
+		healthDB = pool
+	}
+
 	redisURL := os.Getenv("REDIS_URL")
 	if redisURL == "" {
 		redisURL = "redis://localhost:6379"
@@ -75,42 +70,22 @@ func main() {
 		os.Exit(1)
 	}
 	redisClient := redis.NewClient(redisOpts)
+	defer redisClient.Close()
 
-	// ---------------------------------------------------------------------------
-	// WebSocket hub + Redis Streams consumer
-	// ---------------------------------------------------------------------------
 	hub := ws.NewHub()
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-
 	go ws.StartConsumer(ctx, redisClient, hub)
 
-	// ---------------------------------------------------------------------------
-	// HTTP router with middleware
-	// ---------------------------------------------------------------------------
 	mux := http.NewServeMux()
-
-	// GET /v1/health — indexer liveness (issue #62)
-	mux.HandleFunc("GET /v1/health", handlers.Health(dbConn))
-
-	// GET /v1/events — validated, cursor-paginated event listing (issues #42, #44)
+	mux.HandleFunc("GET /v1/health", handlers.Health(healthDB))
 	mux.HandleFunc("GET /v1/events", handlers.ListEvents)
-
-	// GET /v1/events/{id} — single event by UUID v4 (issue #42)
 	mux.HandleFunc("GET /v1/events/{id}", handlers.GetEvent)
-
 	mux.HandleFunc("GET /v1/events/stream", handlers.Stream(redisClient))
-
-	// WebSocket: /ws — real-time event subscription endpoint (issue #15)
+	mux.HandleFunc("GET /v1/admin/db", handlers.AdminDB(adminConfig()))
 	mux.HandleFunc("/ws", ws.Handler(hub))
 
-	// Apply middleware chain: request ID → structured logging
-	handler := middleware.Chain(
-		mux,
-		middleware.StructuredLogging,
-		middleware.RequestID,
-	)
+	handler := middleware.Chain(mux, middleware.StructuredLogging, middleware.RequestID)
 
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%s", port),
@@ -119,7 +94,6 @@ func main() {
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
-
 	go func() {
 		slog.Info("Trident API server listening", "port", port)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -130,10 +104,45 @@ func main() {
 
 	<-ctx.Done()
 	slog.Info("shutting down")
-
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		slog.Error("graceful shutdown failed", "err", err)
 	}
+}
+
+func newDBPool(ctx context.Context, dsn string, poolSize int32) (*pgxpool.Pool, error) {
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse DATABASE_URL: %w", err)
+	}
+	cfg.MaxConns = poolSize
+	cfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ping database: %w", err)
+	}
+	return pool, nil
+}
+
+func dbPoolSizeFromEnv() int32 {
+	if raw := os.Getenv("GO_API_DB_POOL_SIZE"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			return int32(n)
+		}
+		slog.Warn("invalid GO_API_DB_POOL_SIZE; using default", "value", raw, "default", defaultDBPoolSize)
+	}
+	return defaultDBPoolSize
+}
+
+func adminConfig() handlers.AdminConfig {
+	cfg := handlers.AdminConfig{AdminKey: os.Getenv("ADMIN_API_KEY")}
+	if adminURL := os.Getenv("PGBOUNCER_ADMIN_URL"); adminURL != "" {
+		cfg.StatsFunc = newPgbouncerStats(adminURL)
+	}
+	return cfg
 }
