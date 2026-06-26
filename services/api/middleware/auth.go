@@ -1,4 +1,3 @@
-// Package middleware contains HTTP middleware for the Trident API.
 package middleware
 
 import (
@@ -9,15 +8,6 @@ import (
 	"os"
 	"strings"
 )
-
-// hashKey returns the HMAC-SHA256 hex digest of key with API_KEY_SALT.
-// The salt is read on each call so tests can set the env var at any time.
-func hashKey(key string) string {
-	salt := []byte(os.Getenv("API_KEY_SALT"))
-	mac := hmac.New(sha256.New, salt)
-	mac.Write([]byte(key))
-	return hex.EncodeToString(mac.Sum(nil))
-}
 
 // ParseKeyHashes parses a comma-separated list of HMAC-SHA256 hex digests
 // (as stored in API_KEY_HASHES) into a set for O(1) lookup.
@@ -32,30 +22,51 @@ func ParseKeyHashes(raw string) map[string]struct{} {
 	return out
 }
 
-// Auth returns middleware that validates the X-API-Key header on all /v1/*
-// and /ws requests. GET /v1/health is always allowed through.
-//
-// validHashes is the set of accepted HMAC-SHA256 hex digests of valid keys.
-// In production, load these from the database / config.
+func hashKey(key string) string {
+	salt := []byte(os.Getenv("API_KEY_SALT"))
+	mac := hmac.New(sha256.New, salt)
+	mac.Write([]byte(key))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// Auth validates X-API-Key for protected API and WebSocket routes.
+// GET /v1/health remains public. validHashes is the pre-parsed set of
+// accepted HMAC-SHA256 hex digests. When validHashes is empty all requests
+// pass through (auth is disabled — suitable for local development).
 func Auth(validHashes map[string]struct{}, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Skip auth for the health endpoint.
 		if r.Method == http.MethodGet && r.URL.Path == "/v1/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		if len(validHashes) == 0 {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		if !strings.HasPrefix(r.URL.Path, "/v1/") && r.URL.Path != "/ws" {
 			next.ServeHTTP(w, r)
 			return
 		}
 
 		key := r.Header.Get("X-API-Key")
 		if key == "" {
-			http.Error(w, `{"error":"missing X-API-Key header"}`, http.StatusUnauthorized)
+			http.Error(w, , http.StatusUnauthorized)
 			return
 		}
 
 		if _, ok := validHashes[hashKey(key)]; !ok {
-			http.Error(w, `{"error":"invalid API key"}`, http.StatusUnauthorized)
+			http.Error(w, , http.StatusUnauthorized)
 			return
 		}
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+// APIKey is a convenience wrapper around Auth that reads API_KEY_HASHES from
+// the environment on each call.
+func APIKey(next http.Handler) http.Handler {
+	return Auth(ParseKeyHashes(os.Getenv("API_KEY_HASHES")), next)
 }

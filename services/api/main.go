@@ -7,13 +7,20 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
-	"github.com/Depo-dev/trident/services/api/grpcclient"
+	"github.com/Depo-dev/trident/services/api/grpc"
 	"github.com/Depo-dev/trident/services/api/handlers"
+	"github.com/Depo-dev/trident/services/api/middleware"
+	"github.com/Depo-dev/trident/services/api/ws"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 )
+
+const defaultDBPoolSize = 5
 
 func main() {
 	port := os.Getenv("PORT")
@@ -21,62 +28,64 @@ func main() {
 		port = "3000"
 	}
 
-	// ---------------------------------------------------------------------------
-	// Postgres connection (health endpoint)
-	// ---------------------------------------------------------------------------
-	var dbConn *pgx.Conn
+	grpcAddr := os.Getenv("GRPC_ADDR")
+	if grpcAddr == "" {
+		grpcAddr = "localhost:5000"
+	}
+	grpcClient, err := grpc.NewClient(context.Background(), grpcAddr)
+	if err != nil {
+		slog.Error("failed to connect to gRPC backend", "err", err)
+		os.Exit(1)
+	}
+	defer grpcClient.Close()
+	handlers.SetEventsClient(grpcClient)
+
+	var pool *pgxpool.Pool
 	if dsn := os.Getenv("DATABASE_URL"); dsn != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		conn, err := pgx.Connect(ctx, dsn)
+		p, err := newDBPool(ctx, dsn, dbPoolSizeFromEnv())
 		cancel()
 		if err != nil {
-			slog.Warn("could not connect to database; health endpoint will return 503", "err", err)
+			slog.Warn("could not connect to database; DB-backed endpoints will return 503", "err", err)
 		} else {
-			dbConn = conn
-			defer conn.Close(context.Background())
+			pool = p
+			defer pool.Close()
 		}
 	} else {
-		slog.Warn("DATABASE_URL not set; health endpoint will return 503")
+		slog.Warn("DATABASE_URL not set; DB-backed endpoints will return 503")
 	}
 
+	var healthDB handlers.DBPool
+	if pool != nil {
+		healthDB = pool
+	}
+
+	redisURL := os.Getenv("REDIS_URL")
+	if redisURL == "" {
+		redisURL = "redis://localhost:6379"
+	}
+	redisOpts, err := redis.ParseURL(redisURL)
+	if err != nil {
+		slog.Error("invalid REDIS_URL", "err", err)
+		os.Exit(1)
+	}
+	redisClient := redis.NewClient(redisOpts)
+	defer redisClient.Close()
+
+	hub := ws.NewHub()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	go ws.StartConsumer(ctx, redisClient, hub)
+
 	mux := http.NewServeMux()
-
-	// ---------------------------------------------------------------------------
-	// HTTP router
-	// ---------------------------------------------------------------------------
-	mux := http.NewServeMux()
-
-	// GET /v1/health — indexer liveness (issue #62)
-	mux.HandleFunc("GET /v1/health", handlers.Health(dbConn, grpcConn))
-
-	// GET /v1/events — validated, cursor-paginated event listing (issues #42, #44)
+	mux.HandleFunc("GET /v1/health", handlers.Health(healthDB))
 	mux.HandleFunc("GET /v1/events", handlers.ListEvents)
-
-	// GET /v1/events/{id} — single event by UUID v4 (issue #42)
 	mux.HandleFunc("GET /v1/events/{id}", handlers.GetEvent)
+	mux.HandleFunc("GET /v1/events/stream", handlers.Stream(redisClient))
+	mux.HandleFunc("GET /v1/admin/db", handlers.AdminDB(adminConfig()))
+	mux.HandleFunc("/ws", ws.Handler(hub))
 
-	// ---------------------------------------------------------------------------
-	// GraphQL handler
-	// Mount the GraphQL endpoint here, e.g. using gqlgen:
-	//   srv := handler.NewDefaultServer(generated.NewExecutableSchema(cfg))
-	//   mux.Handle("/graphql", srv)
-	//   mux.Handle("/playground", playground.Handler("Trident", "/graphql"))
-	// ---------------------------------------------------------------------------
-
-	// ---------------------------------------------------------------------------
-	// WebSocket handler
-	// Mount the WebSocket subscription endpoint here. Clients subscribe to a
-	// contract address and receive a stream of SorobanEvent JSON objects in
-	// real time as they land on-chain.
-	//   mux.HandleFunc("/ws", ws.Handler(redisClient))
-	// ---------------------------------------------------------------------------
-
-	// ---------------------------------------------------------------------------
-	// Redis Streams consumer
-	// Start the background consumer here. It reads from the Redis Stream written
-	// by the Rust indexer and fans out to connected WebSocket clients.
-	//   go consumer.Start(ctx, redisClient, hub)
-	// ---------------------------------------------------------------------------
+	handler := middleware.Chain(mux, middleware.StructuredLogging, middleware.RequestID)
 
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%s", port),
@@ -85,7 +94,6 @@ func main() {
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
-
 	go func() {
 		slog.Info("Trident API server listening", "port", port)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -96,10 +104,45 @@ func main() {
 
 	<-ctx.Done()
 	slog.Info("shutting down")
-
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		slog.Error("graceful shutdown failed", "err", err)
 	}
+}
+
+func newDBPool(ctx context.Context, dsn string, poolSize int32) (*pgxpool.Pool, error) {
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse DATABASE_URL: %w", err)
+	}
+	cfg.MaxConns = poolSize
+	cfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ping database: %w", err)
+	}
+	return pool, nil
+}
+
+func dbPoolSizeFromEnv() int32 {
+	if raw := os.Getenv("GO_API_DB_POOL_SIZE"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			return int32(n)
+		}
+		slog.Warn("invalid GO_API_DB_POOL_SIZE; using default", "value", raw, "default", defaultDBPoolSize)
+	}
+	return defaultDBPoolSize
+}
+
+func adminConfig() handlers.AdminConfig {
+	cfg := handlers.AdminConfig{AdminKey: os.Getenv("ADMIN_API_KEY")}
+	if adminURL := os.Getenv("PGBOUNCER_ADMIN_URL"); adminURL != "" {
+		cfg.StatsFunc = newPgbouncerStats(adminURL)
+	}
+	return cfg
 }

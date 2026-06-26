@@ -1,18 +1,9 @@
 version: "3.9"
 
-# Production compose — runs all five containers.
-# Copy .env.example to .env and fill in every value before running.
-# Start: docker compose -f docker-compose.yml up -d
-
-x-logging: &default-logging
-  driver: json-file
-  options:
-    max-size: "10m"
-    max-file: "3"
+# Production compose — runs all four services.
+# All secrets are passed via environment variables; never hardcode values here.
 
 services:
-  # ── Infrastructure ─────────────────────────────────────────────────────────
-
   postgres:
     image: postgres:15-alpine
     environment:
@@ -28,119 +19,102 @@ services:
       retries: 10
       start_period: 15s
     restart: unless-stopped
-    logging: *default-logging
-    deploy:
-      resources:
-        limits:
-          memory: 256m
 
   redis:
     image: redis:7-alpine
     volumes:
       - redis_data:/data
     command: redis-server --appendonly yes
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 10s
     restart: unless-stopped
-    logging: *default-logging
-    deploy:
-      resources:
-        limits:
-          memory: 128m
 
-  # ── Rust services ──────────────────────────────────────────────────────────
+  # ---------------------------------------------------------------------------
+  # PgBouncer — transaction-mode connection pooler (issue #87)
+  #
+  # Every service connects here (pgbouncer:6432) instead of Postgres directly.
+  # PgBouncer multiplexes the many short-lived application connections over a
+  # small set of real Postgres connections, so Postgres never approaches its
+  # max_connections limit even with several Go API replicas.
+  #
+  # Transaction mode holds a server connection only for the duration of a
+  # transaction; idle client connections cost nothing. See docs/deployment.md
+  # for the prepared-statement / session-variable caveats this implies.
+  # ---------------------------------------------------------------------------
+  pgbouncer:
+    image: pgbouncer/pgbouncer:1.22
+    environment:
+      DATABASES_HOST: postgres
+      DATABASES_PORT: 5432
+      DATABASES_DBNAME: ${POSTGRES_DB}
+      DATABASES_USER: ${POSTGRES_USER}
+      DATABASES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGBOUNCER_LISTEN_PORT: 6432
+      PGBOUNCER_AUTH_TYPE: scram-sha-256
+      PGBOUNCER_POOL_MODE: transaction
+      PGBOUNCER_MAX_CLIENT_CONN: 1000
+      # DEFAULT_POOL_SIZE must be >= the sum of every service's per-instance
+      # pool size times its replica count. With the defaults below
+      # (indexer 3 + gRPC API 10 + 3 Go API replicas * 5 = 28) a value of 20
+      # is the per-(user,db) ceiling PgBouncer keeps open to Postgres; raise it
+      # together with Postgres max_connections when scaling out.
+      PGBOUNCER_DEFAULT_POOL_SIZE: 20
+      PGBOUNCER_MIN_POOL_SIZE: 5
+      PGBOUNCER_SERVER_TLS_SSLMODE: prefer
+      # Allow the application user to read SHOW POOLS / SHOW STATS from the
+      # admin console (consumed by GET /v1/admin/db).
+      PGBOUNCER_ADMIN_USERS: ${POSTGRES_USER}
+      PGBOUNCER_STATS_USERS: ${POSTGRES_USER}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
 
   indexer:
     build:
-      context: ..
-      dockerfile: crates/indexer/Dockerfile
+      context: ../crates/indexer
+      dockerfile: Dockerfile
     environment:
-      DATABASE_URL: ${DATABASE_URL}
+      # Route through PgBouncer, never postgres:5432 directly.
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pgbouncer:6432/${POSTGRES_DB}
+      INDEXER_DB_POOL_SIZE: ${INDEXER_DB_POOL_SIZE:-3}
       REDIS_URL: ${REDIS_URL}
       STELLAR_RPC_URL: ${STELLAR_RPC_URL}
       NETWORK: ${NETWORK}
       POLL_INTERVAL_MS: ${POLL_INTERVAL_MS}
       INDEX_DIAGNOSTIC: ${INDEX_DIAGNOSTIC}
-      REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN}
-      RUST_LOG: ${LOG_LEVEL}
+      LOG_LEVEL: ${LOG_LEVEL}
     depends_on:
-      postgres:
-        condition: service_healthy
+      pgbouncer:
+        condition: service_started
       redis:
-        condition: service_healthy
+        condition: service_started
     restart: unless-stopped
-    logging: *default-logging
-    deploy:
-      resources:
-        limits:
-          memory: 512m
 
-  grpc-api:
+  api:
     build:
-      context: ..
-      dockerfile: crates/api/Dockerfile
+      context: ../services/api
+      dockerfile: Dockerfile
     environment:
-      DATABASE_URL: ${DATABASE_URL}
+      # Route through PgBouncer, never postgres:5432 directly.
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pgbouncer:6432/${POSTGRES_DB}
+      GO_API_DB_POOL_SIZE: ${GO_API_DB_POOL_SIZE:-5}
+      # PgBouncer admin console — backs GET /v1/admin/db.
+      PGBOUNCER_ADMIN_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pgbouncer:6432/pgbouncer
+      ADMIN_API_KEY: ${ADMIN_API_KEY}
       REDIS_URL: ${REDIS_URL}
-      GRPC_ADDR: ${GRPC_ADDR}
-      RUST_LOG: ${LOG_LEVEL}
-    healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 50051 || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 20s
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    restart: unless-stopped
-    logging: *default-logging
-    deploy:
-      resources:
-        limits:
-          memory: 512m
-
-  # ── Go API ─────────────────────────────────────────────────────────────────
-
-  go-api:
-    build:
-      context: ..
-      dockerfile: services/api/Dockerfile
-    environment:
-      DATABASE_URL: ${DATABASE_URL}
       PORT: ${PORT}
       API_KEY_SALT: ${API_KEY_SALT}
       API_KEY_HASHES: ${API_KEY_HASHES}
-      RATE_LIMIT_RPS: ${RATE_LIMIT_RPS}
-      RATE_LIMIT_BURST: ${RATE_LIMIT_BURST}
-      GRPC_TARGET: ${GRPC_TARGET}
+      LOG_LEVEL: ${LOG_LEVEL}
     ports:
       - "${PORT}:${PORT}"
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:${PORT}/v1/health || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 15s
     depends_on:
-      postgres:
-        condition: service_healthy
+      pgbouncer:
+        condition: service_started
       redis:
-        condition: service_healthy
-      grpc-api:
-        condition: service_healthy
+        condition: service_started
+      indexer:
+        condition: service_started
     restart: unless-stopped
-    logging: *default-logging
-    deploy:
-      resources:
-        limits:
-          memory: 256m
 
 volumes:
   postgres_data:
